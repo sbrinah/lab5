@@ -1,28 +1,148 @@
 ---
-title: ""
-author: ""
+title: "lab5"
+author: "Hsi-Hsuan Yang"
 format:
   html:
     embed-resources: true
 ---
 
-## Quarto
-
-Quarto enables you to weave together content and executable code into a finished document. To learn more about Quarto see <https://quarto.org>.
-
-## Running Code
-
-When you click the **Render** button a document will be generated that includes both content and the output of embedded code. You can embed code like this:
-
 ```{r}
-1 + 1
+library(data.table)
+library(dtplyr)
+library(dplyr)
+library(R.utils)
+if (!file.exists("met_all.gz"))
+  download.file(
+    url = "https://raw.githubusercontent.com/USCbiostats/data-science-data/master/02_met/met_all.gz",
+    destfile = "met_all.gz",
+    method   = "libcurl",
+    timeout  = 60
+    )
+met <- data.table::fread("met_all.gz")
+# Download the data
+stations <- fread("ftp://ftp.ncdc.noaa.gov/pub/data/noaa/isd-history.csv")
+stations[, USAF := as.integer(USAF)]
 ```
 
-You can add options to executable code like this
-
 ```{r}
-#| echo: false
-2 * 2
+# Dealing with NAs and 999999
+stations[, USAF   := fifelse(USAF == 999999, NA_integer_, USAF)]
+stations[, CTRY   := fifelse(CTRY == "", NA_character_, CTRY)]
+stations[, STATE  := fifelse(STATE == "", NA_character_, STATE)]
+# Selecting the three relevant columns, and keeping unique records
+stations <- unique(stations[, list(USAF, CTRY, STATE)])
+# Dropping NAs
+stations <- stations[!is.na(USAF)]
+# Removing duplicates
+stations[, n := 1:.N, by = .(USAF)]
+stations <- stations[n == 1,][, n := NULL]
+dat <- merge(
+  x     = met,      
+  y     = stations, 
+  by.x  = "USAFID",
+  by.y  = "USAF", 
+  all.x = TRUE,      
+  all.y = FALSE
+  )
+```
+Question 1: Representative station for the US
+```{r}
+#median on temp, wind speed, pressure by state using median function
+ dat[, .(
+    temp_med      = median(temp, na.rm=TRUE),
+    wind.sp_med   = median(wind.sp, na.rm=TRUE),
+    atm.press_med = median(atm.press, na.rm = TRUE)
+    ),
+    by = STATE
+    ]
+```
+```{r}
+datstations <- dat[, .(
+    wind.sp   = mean(wind.sp, na.rm = TRUE),
+    atm.press = mean(atm.press, na.rm = TRUE),
+    temp      = mean(temp, na.rm = TRUE)
+  ), by = .(USAFID, STATE)]
+
+# median using quantile function
+datstations[, tempmed   := quantile(temp, probs = .5, na.rm = TRUE)]
+datstations[, atmpmed  := quantile(atm.press, probs = .5, na.rm = TRUE)]
+datstations[, windspmed := quantile(wind.sp, probs = .5, na.rm = TRUE)]
+datstations[which.min(abs(temp - tempmed))]
+datstations[which.min(abs(atm.press - atmpmed))]
+datstations[which.min(abs(wind.sp - windspmed))]
+```
+These three stations don't coincide.
+
+Question 2: Representative station per state
+```{r}
+datstations[, tempstatemed   := quantile(temp, probs = .5, na.rm = TRUE), by = STATE]
+datstations[, atmpstatemed   := quantile(atm.press, probs = .5, na.rm = TRUE), by = STATE]
+datstations[, windspstatemed := quantile(wind.sp, probs = .5, na.rm = TRUE), by = STATE]
+#atmospheric pressure
+datstations[, tempdif  := which.min(abs(atm.press - atmpstatemed)), by=STATE]
+datstations[, record:= 1:.N, by = STATE]
+datstations[record == tempdif, .(USAFID, atm.press, atmpstatemed, by=STATE)]
+#wind speed
+datstations[, tempdif  := which.min(abs(wind.sp - windspstatemed)), by=STATE]
+datstations[record == tempdif, .(USAFID, wind.sp, windspstatemed, by=STATE)]
+#temp
+datstations[, tempdif  := which.min(abs(temp - tempstatemed)), by=STATE]
+datstations[record == tempdif, .(USAFID, temp, tempstatemed, STATE)]
+```
+Question 3: in the middle
+```{r}
+#what is the station that is closest to the mid-point of the state
+datstationsmid <-unique(dat[, .(USAFID, STATE, lon, lat)])
+datstationsmid[, latmidpt := quantile(lat, probs = .5, na.rm = TRUE), by = STATE]
+datstationsmid[, lonmidpt := quantile(lon, probs = .5, na.rm = TRUE), by = STATE]
+datstationsmid[, distance := sqrt((lat - latmidpt)^2 + (lon - lonmidpt)^2)]
+datstationsmid[, minrecord := which.min(distance), by = STATE]
+datstationsmid[, n := 1:.N, by = STATE]
+location <- datstationsmid[n == minrecord, .(USAFID, STATE, lon, lat)]
+location
+```
+```{r}
+all <- dat[, .(USAFID, lat, lon, STATE)][, .SD[1], by = "USAFID"]
+datstations[, tempdif := which.min(abs(temp - tempstatemed)), by=STATE]
+datstations[record == tempdif, .(USAFID, temp, tempstatemed, STATE)]
+dat_temp <- datstations[record == tempdif, .(USAFID, temp, tempstatemed, STATE)]
+dat_temp
+dat_temp <- merge(
+  x = dat_temp,
+  y = all,
+  by = "USAFID",
+  all.x = TRUE, all.y = FALSE
+)
+library(leaflet)
+statecenter <- location[, .(lon, lat)]
+statecenter[, type := "Center of the state"]
+tempcenter <- dat_temp[, .(lon, lat)]
+tempcenter[, type := "Center of the temperature"]
+datnew <- rbind(statecenter, tempcenter)
+plotdatnew <- colorFactor(c('purple', 'orange'),
+                       domain = as.factor(datnew$type))
+leaflet(datnew) %>%
+  addProviderTiles("OpenStreetMap") %>%
+  addCircles(lng = ~lon, lat = ~lat, color=~plotdatnew(type), opacity=1,fillOpacity=1, radius=500)
+```
+Question 4
+```{r}
+avgtempstate<-dat[, tempstate := mean(temp, na.rm = TRUE), by = STATE]
+dat[,templevel := fifelse(
+  tempstate <20, "low-temp",
+  fifelse(tempstate<25 & tempstate>=20,"mid-temp",
+          "high-temp")
+                          )]
+table(avgtempstate$tempstate, useNA="always")
+dat[,.(
+  entries= .N,
+  missing=sum(is.na(.SD)),
+  numbofstations=  length(unique(USAFID)),
+  numbofstates= length(unique(STATE)),
+  meantemp= mean(temp, na.rm=TRUE),
+  meanwp= mean(wind.sp, na.rm=TRUE),
+  meanatmp= mean(atm.press, na.rm=TRUE)
+), by=templevel]
 ```
 
-The `echo: false` option disables the printing of code (only output is displayed).
+
